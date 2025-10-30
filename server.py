@@ -1,85 +1,128 @@
 import socket
 import threading
+from datetime import datetime
 
-# Server configuration
-HOST = '127.0.0.1'
+HOST = "0.0.0.0"
 PORT = 12345
 
-# Create a TCP/IP socket
-server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server.bind((HOST, PORT))
-server.listen()
+clients = {}            # conn -> username
+clients_lock = threading.Lock()
 
-print(f"Server started and listening on {HOST}:{PORT}...")
 
-# List to store all connected clients
-clients = []
-nicknames = []
-
-# Broadcast message to all clients
 def broadcast(message, sender_conn=None):
-    for client in clients:
-        # Don’t send back to the sender if sender_conn is given
-        if client != sender_conn:
+    """Send message (str) to all connected clients except sender_conn."""
+    with clients_lock:
+        for conn in list(clients.keys()):
+            if conn == sender_conn:
+                continue
             try:
-                client.send(message)
-            except:
-                # Remove disconnected clients safely
-                index = clients.index(client)
-                clients.remove(client)
-                client.close()
-                nickname = nicknames[index]
-                nicknames.remove(nickname)
-                broadcast(f"{nickname} has been disconnected unexpectedly.\n".encode())
+                conn.send(message.encode("utf-8"))
+            except Exception:
+                # remove dead connections
+                try:
+                    conn.close()
+                except:
+                    pass
+                remove_client(conn)
 
-# Handle messages from a single client
+
 def handle_client(conn, addr):
-    print(f"New connection from {addr}")
-    
-    # Ask for a nickname
-    conn.send("Enter your nickname: ".encode())
-    nickname = conn.recv(1024).decode()
-    nicknames.append(nickname)
-    clients.append(conn)
+    username = None
+    try:
+        # Expect first message from client to be the username
+        raw = conn.recv(1024)
+        if not raw:
+            conn.close()
+            return
+        username = raw.decode("utf-8", errors="replace").strip()
+        if not username:
+            conn.close()
+            return
 
-    print(f"Nickname of {addr} is {nickname}")
-    broadcast(f"\n{nickname} joined the chat!\n".encode(), sender_conn=conn)
-    conn.send("Connected to the server! Type 'exit' to leave.\n".encode())
+        with clients_lock:
+            clients[conn] = username
 
-    while True:
+        join_msg = f"[{datetime.now().strftime('%I:%M %p')}] Server: {username} joined the chat!"
+        print(join_msg)
+        broadcast(join_msg, sender_conn=None)
+
+        # Main receive loop
+        while True:
+            data = conn.recv(4096)
+            if not data:
+                # client disconnected
+                break
+            msg = data.decode("utf-8", errors="replace").strip()
+            if not msg:
+                continue
+
+            if msg.lower() == "exit":
+                # client requested exit
+                break
+
+            timestamp = datetime.now().strftime("[%I:%M %p]")
+            formatted = f"{timestamp} {username}: {msg}"
+            print(formatted)
+            # broadcast to all OTHER clients (sender sees own msg locally)
+            broadcast(formatted, sender_conn=conn)
+
+    except Exception as e:
+        print(f"Exception with {addr}: {e}")
+
+    finally:
+        # clean up and announce leave
+        if username:
+            with clients_lock:
+                if conn in clients:
+                    del clients[conn]
         try:
-            message = conn.recv(1024).decode()
-            if not message:
-                break
-            
-            # Handle exit message
-            if message.lower() == "exit":
-                broadcast(f"\n{nickname} has left the chat.\n".encode(), sender_conn=conn)
-                print(f"{nickname} disconnected.")
-                conn.send("You have left the chat. Goodbye!\n".encode())
-                conn.close()
-                clients.remove(conn)
-                nicknames.remove(nickname)
-                break
-
-            # Broadcast the message to everyone
-            full_msg = f"{nickname}: {message}\n"
-            print(full_msg.strip())
-            broadcast(full_msg.encode(), sender_conn=conn)
+            conn.close()
         except:
-            # Handle unexpected disconnection
-            if conn in clients:
-                clients.remove(conn)
-                nickname = nicknames[clients.index(conn)] if conn in clients else "Unknown"
-                broadcast(f"{nickname} has been disconnected.\n".encode())
-            break
+            pass
 
-# Accept incoming connections
-def receive_connections():
-    while True:
-        conn, addr = server.accept()
-        thread = threading.Thread(target=handle_client, args=(conn, addr))
-        thread.start()
+        leave_msg = f"[{datetime.now().strftime('%I:%M %p')}] Server: {username or 'Unknown'} left the chat."
+        print(leave_msg)
+        broadcast(leave_msg, sender_conn=None)
 
-# Start server
-receive_connections()
+
+def remove_client(conn):
+    with clients_lock:
+        if conn in clients:
+            del clients[conn]
+    try:
+        conn.close()
+    except:
+        pass
+
+
+def start_server():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # allow quick restart during development
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((HOST, PORT))
+    server.listen(100)
+    print(f"🚀 Server started on {HOST}:{PORT}")
+    print("Waiting for connections...")
+
+    try:
+        while True:
+            conn, addr = server.accept()
+            print(f"✅ Connection from {addr}")
+            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+    except KeyboardInterrupt:
+        print("Shutting down server...")
+    finally:
+        with clients_lock:
+            for c in list(clients.keys()):
+                try:
+                    c.close()
+                except:
+                    pass
+        try:
+            server.close()
+        except:
+            pass
+
+
+if __name__ == "__main__":
+    start_server()
